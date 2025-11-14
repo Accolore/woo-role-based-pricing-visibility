@@ -2,7 +2,9 @@
 /**
  * Plugin Name: Woo Role-Based Pricing & Visibility
  * Description: Product/category pricing and visibility based on user role for WooCommerce.
- * Author: ChatGPT
+ * Author: Lorenzo Accorinti - https://www.linkedin.com/in/lorenzo-accorinti/
+ * Author URI: https://www.linkedin.com/in/lorenzo-accorinti/
+ * GitHub: https://github.com/lorenzoaccorinti/woo-role-based-pricing-visibility
  * Version: 1.0.0
  * License: GPLv2 or later
  * Text Domain: wc-rbpv
@@ -22,8 +24,6 @@
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 class WCRBPV_Plugin {
-    const OPTION_KEY    = 'wc_rbpv_settings_json';
-    const NONCE_KEY     = 'wc_rbpv_nonce';
     const CAT_META_KEY  = '_wc_rbpv_hidden_roles'; // term meta: array of roles to hide the category from
     const PROD_META_KEY = '_wc_rbpv_hidden_roles'; // post meta: array of roles to hide the product from
     const PRICE_META_PREFIX = '_wc_rbpv_price_'; // post meta: _wc_rbpv_price_{role} = regular price for role
@@ -42,10 +42,9 @@ class WCRBPV_Plugin {
         add_filter( 'woocommerce_get_price_html', [ $this, 'maybe_force_price_html_refresh' ], 20, 2 );
 
         // Visibility: query side (shop/archive/search/related widgets)
-        add_action( 'pre_get_posts', [ $this, 'filter_catalog_queries' ] );
-        add_filter( 'woocommerce_product_query', [ $this, 'filter_woocommerce_product_query' ] );
-        add_filter( 'woocommerce_shortcode_products_query', [ $this, 'filter_woocommerce_shortcode_query' ], 10, 3 );
-        add_filter( 'posts_where', [ $this, 'filter_posts_where' ], 10, 2 );
+        add_action( 'pre_get_posts', [ $this, 'filter_product_queries' ], 999 );
+        add_filter( 'woocommerce_product_query', [ $this, 'filter_product_queries' ], 999 );
+        add_filter( 'woocommerce_shortcode_products_query', [ $this, 'filter_woocommerce_shortcode_query' ], 999, 3 );
 
         // Visibility: single product + archivio categoria accesso diretto
         add_action( 'template_redirect', [ $this, 'block_hidden_single_product' ] );
@@ -67,11 +66,12 @@ class WCRBPV_Plugin {
 
         // ===== UI prodotto: campo "Nascondi prodotto" (multi-selezione ruoli) nella tab Advanced =====
         add_action( 'woocommerce_product_options_advanced', [ $this, 'render_product_advanced_field' ] );
-        add_action( 'woocommerce_process_product_meta', [ $this, 'save_product_advanced_field' ] );
         
         // ===== UI prodotto: campi prezzi per ruolo nella tab General =====
         add_action( 'woocommerce_product_options_general_product_data', [ $this, 'render_product_price_fields' ] );
-        add_action( 'woocommerce_process_product_meta', [ $this, 'save_product_price_fields' ] );
+        
+        // ===== Save product meta (both visibility and prices) =====
+        add_action( 'woocommerce_process_product_meta', [ $this, 'save_product_meta' ] );
         
         // ===== UI variazione: campi prezzi per ruolo =====
         add_action( 'woocommerce_product_after_variable_attributes', [ $this, 'render_variation_price_fields' ], 10, 3 );
@@ -252,19 +252,25 @@ class WCRBPV_Plugin {
 
     /**
      * Returns true if the product (post_id) is hidden for the current role
-     * Checks both direct product hiding and category-based hiding
+     * 
+     * A product is hidden if EITHER:
+     * 1. The product is directly hidden for the role (via product meta)
+     * 2. The product belongs to a category that is hidden for the role
+     * 
+     * @param int $product_id The product post ID
+     * @return bool True if product should be hidden, false otherwise
      */
     public static function is_product_hidden_for_current_role( $product_id ) : bool {
         $role = self::get_current_role();
         
-        // Check if product is directly hidden (post meta)
+        // Level 1: Check if product is directly hidden (post meta)
         $hidden = get_post_meta( $product_id, self::PROD_META_KEY, true );
         $hidden = is_array( $hidden ) ? $hidden : [];
         if ( in_array( $role, $hidden, true ) ) {
             return true;
         }
         
-        // Check if product belongs to any hidden category
+        // Level 2: Check if product belongs to any hidden category
         $terms = wp_get_post_terms( $product_id, 'product_cat', [ 'fields' => 'ids' ] );
         if ( ! is_wp_error( $terms ) && ! empty( $terms ) ) {
             foreach ( (array) $terms as $term_id ) {
@@ -281,116 +287,130 @@ class WCRBPV_Plugin {
      * Finds all categories to hide for the current role
      */
     public static function get_hidden_category_term_ids_for_current_role() : array {
-        // Avoid infinite loops: if already filtering, use direct query
-        if ( self::$filtering_terms ) {
-            global $wpdb;
-            $role = self::get_current_role();
-            $meta_key = self::CAT_META_KEY;
-            
-            // Direct database query to avoid get_terms filter
-            $term_ids = $wpdb->get_col( $wpdb->prepare(
-                "SELECT DISTINCT term_id 
-                FROM {$wpdb->termmeta} 
-                WHERE meta_key = %s 
-                AND meta_value LIKE %s",
-                $meta_key,
-                '%' . $wpdb->esc_like( $role ) . '%'
-            ) );
-            
-            return array_map( 'absint', $term_ids );
+        global $wpdb;
+        $role = self::get_current_role();
+        $meta_key = self::CAT_META_KEY;
+        
+        // Always use direct database query to avoid get_terms filter conflicts
+        // Get all term_ids that have the meta_key set
+        $all_term_ids = $wpdb->get_col( $wpdb->prepare(
+            "SELECT DISTINCT term_id 
+            FROM {$wpdb->termmeta} 
+            WHERE meta_key = %s",
+            $meta_key
+        ) );
+        
+        if ( empty( $all_term_ids ) ) {
+            return [];
         }
         
-        $role = self::get_current_role();
-        $terms = get_terms( [
-            'taxonomy'   => 'product_cat',
-            'hide_empty' => false,
-            'fields'     => 'ids',
-            'meta_query' => [
-                [
-                    'key'     => self::CAT_META_KEY,
-                    'value'   => $role,
-                    'compare' => 'LIKE', // works on serialized arrays
-                ],
-            ],
-        ] );
-        if ( is_wp_error( $terms ) ) return [];
-        return array_map( 'absint', (array) $terms );
+        // Check each term to see if the role is in the hidden roles array
+        $hidden_term_ids = [];
+        foreach ( $all_term_ids as $term_id ) {
+            $hidden_roles = get_term_meta( $term_id, $meta_key, true );
+            if ( ! is_array( $hidden_roles ) ) {
+                continue;
+            }
+            if ( in_array( $role, $hidden_roles, true ) ) {
+                $hidden_term_ids[] = $term_id;
+            }
+        }
+        
+        return array_map( 'absint', $hidden_term_ids );
     }
 
     /**
      * Finds all products to hide for the current role
-     * Includes both directly hidden products and products in hidden categories
+     * 
+     * A product is hidden if EITHER:
+     * 1. The product is directly hidden for the role (via product meta)
+     * 2. The product belongs to a category that is hidden for the role
+     * 
+     * @return array Array of product post IDs that should be hidden
      */
     public static function get_hidden_product_ids_for_current_role() : array {
+        global $wpdb;
         $role = self::get_current_role();
+        $meta_key = self::PROD_META_KEY;
         $hidden_ids = [];
         
         // Get directly hidden products (from post meta)
-        $args = [
-            'post_type'      => 'product',
-            'posts_per_page' => -1,
-            'fields'         => 'ids',
-            'meta_query'     => [
-                [
-                    'key'     => self::PROD_META_KEY,
-                    'value'   => $role,
-                    'compare' => 'LIKE', // works on serialized arrays
-                ],
-            ],
-        ];
-        $query = new WP_Query( $args );
-        if ( $query->have_posts() ) {
-            $hidden_ids = array_map( 'absint', $query->posts );
-        }
+        // Use direct database query to avoid WP_Query filter conflicts and ensure accuracy
+        $all_product_ids = $wpdb->get_col( $wpdb->prepare(
+            "SELECT DISTINCT post_id 
+            FROM {$wpdb->postmeta} 
+            WHERE meta_key = %s",
+            $meta_key
+        ) );
         
-        // Get products in hidden categories
-        $hide_cats_ids = self::get_hidden_category_term_ids_for_current_role();
-        if ( ! empty( $hide_cats_ids ) ) {
-            // Use direct database query to avoid potential issues with WP_Query filters
-            global $wpdb;
-            $placeholders = implode( ',', array_fill( 0, count( $hide_cats_ids ), '%d' ) );
-            $products_in_hidden_cats = $wpdb->get_col( $wpdb->prepare(
-                "SELECT DISTINCT tr.object_id 
-                FROM {$wpdb->term_relationships} tr
-                INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
-                WHERE tt.taxonomy = 'product_cat'
-                AND tt.term_id IN ($placeholders)
-                AND tr.object_id IN (
-                    SELECT ID FROM {$wpdb->posts} 
-                    WHERE post_type = 'product' 
-                    AND post_status = 'publish'
-                )",
-                ...$hide_cats_ids
-            ) );
-            
-            if ( ! empty( $products_in_hidden_cats ) ) {
-                $products_in_hidden_cats = array_map( 'absint', $products_in_hidden_cats );
-                $hidden_ids = array_unique( array_merge( $hidden_ids, $products_in_hidden_cats ) );
+        if ( ! empty( $all_product_ids ) ) {
+            foreach ( $all_product_ids as $product_id ) {
+                $hidden_roles = get_post_meta( $product_id, $meta_key, true );
+                if ( ! is_array( $hidden_roles ) ) {
+                    continue;
+                }
+                if ( in_array( $role, $hidden_roles, true ) ) {
+                    $hidden_ids[] = $product_id;
+                }
             }
         }
         
-        return $hidden_ids;
-    }
-
-    /** Filters catalog queries */
-    public function filter_catalog_queries( $q ) {
-        if ( is_admin() || ! $q->is_main_query() ) return;
-        if ( ! ( $q->is_post_type_archive( 'product' ) || $q->is_tax( [ 'product_cat', 'product_tag' ] ) || $q->is_search() || $q->is_home() ) ) return;
-
-        // Get all hidden products (includes products in hidden categories)
-        $hide_prod_ids = self::get_hidden_product_ids_for_current_role();
-        
-        // Exclude all hidden products from catalog queries
-        if ( ! empty( $hide_prod_ids ) ) {
-            $post__not_in = (array) $q->get( 'post__not_in' );
-            $q->set( 'post__not_in', array_unique( array_merge( $post__not_in, $hide_prod_ids ) ) );
+        // Get products in hidden categories (second level of hiding)
+        $hide_cats_ids = self::get_hidden_category_term_ids_for_current_role();
+        if ( ! empty( $hide_cats_ids ) ) {
+            // Use direct database query to avoid potential issues with WP_Query filters
+            // First get term_taxonomy_id from term_id, then find products
+            $placeholders = implode( ',', array_fill( 0, count( $hide_cats_ids ), '%d' ) );
+            
+            // Get term_taxonomy_id for the hidden category term_ids
+            $term_taxonomy_ids = $wpdb->get_col( $wpdb->prepare(
+                "SELECT term_taxonomy_id 
+                FROM {$wpdb->term_taxonomy} 
+                WHERE taxonomy = 'product_cat'
+                AND term_id IN ($placeholders)",
+                ...$hide_cats_ids
+            ) );
+            
+            if ( ! empty( $term_taxonomy_ids ) ) {
+                $tt_placeholders = implode( ',', array_fill( 0, count( $term_taxonomy_ids ), '%d' ) );
+                $products_in_hidden_cats = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT DISTINCT tr.object_id 
+                    FROM {$wpdb->term_relationships} tr
+                    WHERE tr.term_taxonomy_id IN ($tt_placeholders)
+                    AND tr.object_id IN (
+                        SELECT ID FROM {$wpdb->posts} 
+                        WHERE post_type = 'product' 
+                        AND post_status = 'publish'
+                    )",
+                    ...$term_taxonomy_ids
+                ) );
+                
+                if ( ! empty( $products_in_hidden_cats ) ) {
+                    $products_in_hidden_cats = array_map( 'absint', $products_in_hidden_cats );
+                    $hidden_ids = array_unique( array_merge( $hidden_ids, $products_in_hidden_cats ) );
+                }
+            }
         }
+        
+        return array_map( 'absint', $hidden_ids );
     }
 
-    /** Filters WooCommerce product queries (shop page, etc.) */
-    public function filter_woocommerce_product_query( $q ) {
+    /** Filters product queries (shop/archive/search/WooCommerce queries) */
+    public function filter_product_queries( $q ) {
         if ( is_admin() ) return;
         
+        // Check if this is a product query
+        $post_type = $q->get( 'post_type' );
+        $is_product_query = ( $post_type === 'product' || ( is_array( $post_type ) && in_array( 'product', $post_type, true ) ) );
+        
+        // Also check for shop/archive/search queries
+        $is_product_context = $is_product_query || 
+                              $q->is_post_type_archive( 'product' ) || 
+                              $q->is_tax( [ 'product_cat', 'product_tag' ] ) || 
+                              ( $q->is_search() && $is_product_query );
+        
+        if ( ! $is_product_context ) return;
+
         // Get all hidden products (includes products in hidden categories)
         $hide_prod_ids = self::get_hidden_product_ids_for_current_role();
         
@@ -419,32 +439,6 @@ class WCRBPV_Plugin {
         return $query_args;
     }
 
-    /** Additional filter using posts_where to ensure products are excluded */
-    public function filter_posts_where( $where, $query ) {
-        // Only filter product queries on frontend
-        if ( is_admin() || ! $query->is_main_query() ) {
-            return $where;
-        }
-        
-        // Check if this is a product query
-        $post_type = $query->get( 'post_type' );
-        if ( $post_type !== 'product' && ( ! is_array( $post_type ) || ! in_array( 'product', $post_type, true ) ) ) {
-            return $where;
-        }
-        
-        // Get all hidden products (includes products in hidden categories)
-        $hide_prod_ids = self::get_hidden_product_ids_for_current_role();
-        
-        // Exclude hidden products using SQL WHERE clause
-        if ( ! empty( $hide_prod_ids ) ) {
-            global $wpdb;
-            $hide_prod_ids = array_map( 'absint', $hide_prod_ids );
-            $placeholders = implode( ',', array_fill( 0, count( $hide_prod_ids ), '%d' ) );
-            $where .= $wpdb->prepare( " AND {$wpdb->posts}.ID NOT IN ($placeholders)", ...$hide_prod_ids );
-        }
-        
-        return $where;
-    }
 
     /** 404 on hidden product due to hidden category or explicitly hidden product */
     public function block_hidden_single_product() {
@@ -527,7 +521,7 @@ class WCRBPV_Plugin {
     }
 
     /**
-     * Filters categories in WooCommerce Product Categories widget
+     * Filters categories in WooCommerce Product Categories widget and shortcode
      */
     public function filter_widget_categories( $args ) {
         $hidden_ids = self::get_hidden_category_term_ids_for_current_role();
@@ -535,7 +529,7 @@ class WCRBPV_Plugin {
             return $args;
         }
 
-        // Add exclude parameter to widget args (no admin bypass - categories hidden for a role should be hidden even for admins)
+        // Add exclude parameter (no admin bypass - categories hidden for a role should be hidden even for admins)
         if ( ! isset( $args['exclude'] ) || empty( $args['exclude'] ) ) {
             $args['exclude'] = $hidden_ids;
         } else {
@@ -637,25 +631,6 @@ class WCRBPV_Plugin {
         echo '</div>';
     }
 
-    public function save_product_advanced_field( $post_id ) {
-        if ( ! current_user_can( 'manage_woocommerce' ) ) {
-            return;
-        }
-        
-        if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
-            return;
-        }
-        
-        if ( get_post_type( $post_id ) !== 'product' ) {
-            return;
-        }
-        
-        // Save roles
-        $roles = isset( $_POST['wc_rbpv_product_hidden_roles'] ) ? (array) $_POST['wc_rbpv_product_hidden_roles'] : [];
-        $roles = array_values( array_intersect( $roles, self::get_all_roles() ) ); // whitelist roles
-        update_post_meta( $post_id, self::PROD_META_KEY, $roles );
-    }
-
     /* --------------------------------------
      * UI Product: role-based price fields in General tab
      * ------------------------------------ */
@@ -711,7 +686,10 @@ class WCRBPV_Plugin {
         echo '</div>';
     }
 
-    public function save_product_price_fields( $post_id ) {
+    /**
+     * Saves product meta (visibility and prices) in a single method
+     */
+    public function save_product_meta( $post_id ) {
         if ( ! current_user_can( 'manage_woocommerce' ) ) {
             return;
         }
@@ -724,9 +702,14 @@ class WCRBPV_Plugin {
             return;
         }
         
-        $roles = self::get_all_roles();
+        // Save visibility roles
+        $roles = isset( $_POST['wc_rbpv_product_hidden_roles'] ) ? (array) $_POST['wc_rbpv_product_hidden_roles'] : [];
+        $roles = array_values( array_intersect( $roles, self::get_all_roles() ) ); // whitelist roles
+        update_post_meta( $post_id, self::PROD_META_KEY, $roles );
         
-        foreach ( $roles as $role ) {
+        // Save role-based prices
+        $all_roles = self::get_all_roles();
+        foreach ( $all_roles as $role ) {
             $regular_key = self::PRICE_META_PREFIX . $role;
             $sale_key = self::SALE_PRICE_META_PREFIX . $role;
             
@@ -762,7 +745,41 @@ class WCRBPV_Plugin {
         $roles = self::get_all_roles();
         $variation_id = $variation->ID;
         
-        echo '<div class="wc-rbpv-variation-price-fields" style="border-top:1px solid #eee;padding:15px 0;margin:15px 0;">';
+        // Add custom CSS for better layout
+        echo '<style>
+            .wc-rbpv-variation-price-fields {
+                clear: both;
+            }
+            .wc-rbpv-variation-role-price-group {
+                margin-bottom: 15px;
+            }
+            .wc-rbpv-variation-role-price-group strong {
+                display: block;
+                margin-bottom: 10px;
+                font-size: 13px;
+                color: #23282d;
+            }
+            .wc-rbpv-variation-role-price-group .form-row {
+                display: inline-block;
+                width: 48%;
+                margin-right: 2%;
+                vertical-align: top;
+            }
+            .wc-rbpv-variation-role-price-group .form-row-last {
+                margin-right: 0;
+            }
+            .wc-rbpv-variation-role-price-group .form-row label {
+                display: block;
+                margin-bottom: 5px;
+                font-weight: 600;
+            }
+            .wc-rbpv-variation-role-price-group .form-row input[type="number"] {
+                width: 100%;
+                box-sizing: border-box;
+            }
+        </style>';
+        
+        echo '<div class="wc-rbpv-variation-price-fields" style="border-top:1px solid #eee;padding:15px 0;margin:15px 0;clear:both;">';
         echo '<h4 style="margin:0 0 15px;">' . esc_html__( 'Prices by Role', 'wc-rbpv' ) . '</h4>';
         echo '<p class="description" style="margin:0 0 15px;">' . esc_html__( 'Set specific prices for each role. Leave empty to use the standard variation price.', 'wc-rbpv' ) . '</p>';
         
@@ -772,8 +789,9 @@ class WCRBPV_Plugin {
             $regular_value = get_post_meta( $variation_id, $regular_key, true );
             $sale_value = get_post_meta( $variation_id, $sale_key, true );
             
-            echo '<div class="wc-rbpv-variation-role-price-group" style="border:1px solid #ddd;padding:10px;margin:10px 0;background:#f9f9f9;">';
-            echo '<strong>' . esc_html( ucfirst( $role ) ) . '</strong>';
+            echo '<div class="wc-rbpv-variation-role-price-group" style="border:1px solid #ddd;padding:15px;margin:10px 0;background:#f9f9f9;clear:both;overflow:hidden;">';
+            echo '<strong style="display:block;margin-bottom:10px;font-size:13px;color:#23282d;">' . esc_html( ucfirst( $role ) ) . '</strong>';
+            echo '<div class="form-row" style="display:inline-block;width:48%;margin-right:2%;vertical-align:top;">';
             
             woocommerce_wp_text_input( [
                 'id'            => $regular_key . '_' . $loop,
@@ -781,13 +799,16 @@ class WCRBPV_Plugin {
                 'label'         => __( 'Prezzo regolare', 'wc-rbpv' ),
                 'placeholder'   => __( 'Prezzo standard', 'wc-rbpv' ),
                 'value'         => $regular_value,
-                'wrapper_class' => 'form-row form-row-first',
+                'wrapper_class' => '',
                 'type'          => 'number',
                 'custom_attributes' => [
                     'step' => '0.01',
                     'min'  => '0',
                 ],
             ] );
+            
+            echo '</div>';
+            echo '<div class="form-row form-row-last" style="display:inline-block;width:48%;margin-right:0;vertical-align:top;">';
             
             woocommerce_wp_text_input( [
                 'id'            => $sale_key . '_' . $loop,
@@ -795,7 +816,7 @@ class WCRBPV_Plugin {
                 'label'         => __( 'Prezzo scontato', 'wc-rbpv' ),
                 'placeholder'   => __( 'Prezzo standard', 'wc-rbpv' ),
                 'value'         => $sale_value,
-                'wrapper_class' => 'form-row form-row-last',
+                'wrapper_class' => '',
                 'type'          => 'number',
                 'custom_attributes' => [
                     'step' => '0.01',
@@ -803,6 +824,8 @@ class WCRBPV_Plugin {
                 ],
             ] );
             
+            echo '</div>';
+            echo '<div style="clear:both;"></div>';
             echo '</div>';
         }
         
